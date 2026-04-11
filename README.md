@@ -509,7 +509,14 @@ Major steps of the rewrite:
 
 ## License
 
-Source files under an open license (to be specified). Drivers inspired by Waveshare C code (BSD 2-clause) and `esp-hal` examples (MIT/Apache-2.0).
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
+- MIT License ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
+
+at your option.
+
+Hardware drivers were written from scratch, informed by Waveshare's C/C++ examples and the [esp-hal](https://github.com/esp-rs/esp-hal) ecosystem.
 
 ---
 
