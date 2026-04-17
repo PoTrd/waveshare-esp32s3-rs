@@ -20,24 +20,27 @@ pub enum Page {
     Clock = 0,
     Sensors = 1,
     System = 2,
+    Power = 3,
 }
 
 impl Page {
-    pub fn count() -> usize { 3 }
+    pub fn count() -> usize { 4 }
 
     pub fn next(self) -> Self {
         match self {
             Page::Clock => Page::Sensors,
             Page::Sensors => Page::System,
-            Page::System => Page::Clock,
+            Page::System => Page::Power,
+            Page::Power => Page::Clock,
         }
     }
 
     pub fn prev(self) -> Self {
         match self {
-            Page::Clock => Page::System,
+            Page::Clock => Page::Power,
             Page::Sensors => Page::Clock,
             Page::System => Page::Sensors,
+            Page::Power => Page::System,
         }
     }
 
@@ -51,6 +54,7 @@ impl Page {
             Page::Clock => "CLOCK",
             Page::Sensors => "SENSORS",
             Page::System => "SYSTEM",
+            Page::Power => "POWER",
         }
     }
 }
@@ -110,7 +114,7 @@ pub fn draw_system_page<D: DrawTarget<Color = Rgb565>>(
 
     Text::with_alignment("SYSTEM", Point::new(cx, 40), cyan, Alignment::Center).draw(display)?;
 
-    Text::with_alignment("ESP32-S3 240MHz", Point::new(cx, 90), white, Alignment::Center).draw(display)?;
+    Text::with_alignment("ESP32-S3 160MHz", Point::new(cx, 90), white, Alignment::Center).draw(display)?;
     Text::with_alignment("8MB PSRAM", Point::new(cx, 120), dim, Alignment::Center).draw(display)?;
     Text::with_alignment("32MB Flash", Point::new(cx, 150), dim, Alignment::Center).draw(display)?;
     Text::with_alignment("QSPI 80MHz DMA", Point::new(cx, 180), dim, Alignment::Center).draw(display)?;

@@ -99,9 +99,27 @@ impl<I: I2c> Es8311<I> {
 
     /// Unmute: power up DAC + enable HP output
     pub fn unmute(&mut self) -> Result<(), I::Error> {
+        // Re-enable analog blocks that shutdown() may have powered down.
+        self.write_reg(0x0D, 0x01)?; // Power up analog
+        self.write_reg(0x0E, 0x02)?; // Enable analog PGA + ADC modulator
         self.write_reg(0x12, 0x00)?; // DAC power up (0x00 = on per C ref)
         self.write_reg(0x13, 0x10)?; // Enable HP drive
         self.write_reg(0x32, 0xD0)   // Volume ~80%
+    }
+
+    /// Full shutdown: power down ALL analog blocks (not just mute).
+    /// Use at boot and between playback events — draws ~0 mA from codec.
+    /// `unmute()` re-enables everything on next playback.
+    pub fn shutdown(&mut self) -> Result<(), I::Error> {
+        // Mute + power down DAC path
+        self.write_reg(0x32, 0x00)?; // Volume 0
+        self.write_reg(0x13, 0x00)?; // Disable HP drive
+        self.write_reg(0x12, 0x20)?; // DAC power down (bit 5 = PDN_DAC)
+        // Power down analog PGA + ADC modulator
+        self.write_reg(0x0E, 0xFF)?; // PDN_PGA | PDN_MOD | all analog off
+        // Power down analog bias
+        self.write_reg(0x0D, 0xFC)?; // VMIDSEL=off, IBIAS_PGA off, PDN_ANA
+        Ok(())
     }
 
     pub fn is_initialized(&self) -> bool { self.initialized }

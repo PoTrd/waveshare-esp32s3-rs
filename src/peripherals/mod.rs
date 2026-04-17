@@ -1,4 +1,5 @@
 pub mod power;
+pub mod power_stats;
 pub mod touch;
 pub mod rtc;
 pub mod imu;
@@ -6,3 +7,5 @@ pub mod wifi;
 pub mod audio;
 pub mod sdcard;
 pub mod http;
+pub mod cpu_clock;
+pub mod ble;

@@ -40,11 +40,13 @@ use crate::drivers::co5300::Co5300Display;
 use crate::drivers::framebuffer::Framebuffer;
 use crate::drivers::qspi_bus::QspiBus;
 use crate::peripherals::power::Axp2101Power;
+use crate::peripherals::power_stats::{DisplayState, PowerStats, WifiMode};
 use crate::peripherals::touch::{Ft3168Touch, SwipeDirection};
 use crate::peripherals::rtc::{Pcf85063aRtc, DateTime};
 use crate::peripherals::imu::Qmi8658Imu;
 use crate::ui::watchface::WatchFace;
 use crate::ui::pages::{self, Page};
+use crate::ui::power_page;
 use crate::apps::{App, AppInput, AppResult, AppState};
 use crate::apps::snake::SnakeGame;
 use crate::apps::game2048::Game2048;
@@ -147,6 +149,50 @@ fn days_to_date(days_since_epoch: i32) -> (u32, u32, u32) {
 use embedded_graphics::pixelcolor::Rgb565;
 use embedded_graphics::prelude::RgbColor;
 
+/// Take a cheap snapshot of the current power state into the shared
+/// `PowerStats` struct. Called from the Power page renderer (and from the
+/// swipe preview) so the user sees a live read-out without us adding any
+/// extra sampling. All inputs are already tracked by the main loop.
+fn update_power_stats(
+    stats: &mut PowerStats,
+    screen_state: u8,
+    imu_on: bool,
+    wifi_connected: bool,
+    wifi_on_request: bool,
+    brightness: u8,
+    batt_mv: u16,
+    batt_pct: u8,
+    charging: bool,
+) {
+    stats.display = Some(match screen_state {
+        0 => DisplayState::Off,
+        1 => DisplayState::Aod,
+        2 => DisplayState::Dim,
+        _ => DisplayState::Bright,
+    });
+    stats.wifi = Some(if !wifi_on_request && !wifi_connected {
+        WifiMode::Off
+    } else if wifi_connected {
+        // set_power_save(Maximum) is applied via Config, so once connected
+        // we're in WIFI_PS_MAX_MODEM.
+        WifiMode::PowerSave
+    } else {
+        // Radio up but handshake still in progress.
+        WifiMode::Active
+    });
+    stats.imu_on = imu_on;
+    stats.brightness = brightness;
+    // Audio/SD track "currently drawing current". The codec is in shutdown
+    // except during a beep; the SD is not currently gated (see TODO in
+    // main init). For now, report both off — flip these flags when the
+    // main loop wakes the respective subsystem.
+    stats.audio_on = false;
+    stats.sd_on = false;
+    stats.battery_mv = batt_mv;
+    stats.battery_pct = batt_pct;
+    stats.charging = charging;
+}
+
 #[esp_rtos::main]
 async fn main(_spawner: Spawner) {
     // Heap: 64KB SRAM + PSRAM for large allocs
@@ -184,6 +230,9 @@ async fn main(_spawner: Spawner) {
     // === Power ===
     let mut power = Axp2101Power::new(RefCellDevice::new(&i2c_ref));
     let _ = power.init();
+    // Drop the die-temp ADC channel we never show on the UI — shaves a
+    // few hundred µA off the AXP2101 housekeeping load.
+    let _ = power.trim_adc_channels();
     println!("[POWER] OK");
 
     // === Display 80MHz DMA ===
@@ -333,8 +382,11 @@ async fn main(_spawner: Spawner) {
         Ok(()) => println!("[AUDIO] Codec OK"),
         Err(_) => println!("[AUDIO] Codec FAILED"),
     }
-    // Mute IMMEDIATELY after init, before any I2S traffic
-    let _ = audio_codec.mute();
+    // Full power-down of the analog blocks (not just mute). The PGA, DAC
+    // and HP driver are explicitly cut — saves ~20 mA versus mute() which
+    // only zeroes the volume register. `unmute()` brings them back on
+    // demand at playback time.
+    let _ = audio_codec.shutdown();
 
     // === I2S Audio Output (using public write_dma) ===
     println!("[AUDIO] Init I2S...");
@@ -358,18 +410,47 @@ async fn main(_spawner: Spawner) {
     let beep_len = fill_beep_buffer(unsafe { &mut BEEP_BUF }, 800, 16000, 50);
     println!("[AUDIO] I2S OK ({} bytes beep)", beep_len);
 
-    // === WiFi init (esp-radio) ===
-    println!("[WIFI] Init radio...");
+    // === WiFi init (esp-radio) — RADIO STAYS OFF AT BOOT ===
+    //
+    // POWER BUDGET NOTE:
+    // Up to v0.4 the watch booted straight into a connected WiFi STA with
+    // no power-save configured. The 2.4 GHz radio + PA alone sustains
+    // ~90 mA continuous — the single biggest drain by far, roughly half
+    // of the total ~1-hour runtime the user complained about.
+    //
+    // We now keep the esp-radio stack *initialized* (so we can spin it up
+    // at any time without re-allocating 300 KB of radio buffers) but we
+    // never call `wifi_controller.start()` on boot. The user toggles the
+    // radio on/off with the 'W' button in the top-left of the watchface.
+    // When toggled on, we also immediately set PowerSave::MaxModem so the
+    // radio sleeps between DTIM beacons (~20 mA average instead of 90).
+    //
+    // DHCP + NTP are deferred to the first wake of the radio, so a watch
+    // that never toggles WiFi pays exactly zero network cost.
+    println!("[RADIO] Init radio stack (WiFi OFF, BLE OFF)");
     static RADIO: StaticCell<esp_radio::Controller<'static>> = StaticCell::new();
-    let radio_controller = RADIO.init(esp_radio::init().expect("esp-radio init failed"));
-    let wifi_config = esp_radio::wifi::Config::default();
+    // Coerce &'static mut → &'static so both WiFi and BLE can share the controller.
+    let radio_controller: &'static esp_radio::Controller<'static> =
+        RADIO.init(esp_radio::init().expect("esp-radio init failed"));
+
+    // === WiFi init (OFF by default) ===
+    let wifi_config = esp_radio::wifi::Config::default()
+        .with_power_save_mode(esp_radio::wifi::PowerSaveMode::Maximum);
     let (mut wifi_controller, wifi_interfaces) = esp_radio::wifi::new(
         radio_controller,
         peripherals.WIFI,
         wifi_config,
     ).expect("WiFi init failed");
 
-    // Configure STA mode — set your WiFi credentials here before building.
+    // === BLE init (OFF by default, advertising starts on user toggle) ===
+    let mut ble_connector = esp_radio::ble::controller::BleConnector::new(
+        radio_controller,
+        peripherals.BT,
+        esp_radio::ble::Config::default(),
+    ).expect("BLE init failed");
+    println!("[BLE] Connector ready (advertising OFF)");
+
+    // Pre-fill STA credentials so "toggle WiFi" just flips a bit later.
     use esp_radio::wifi::{ModeConfig, ClientConfig, AuthMethod};
     let client_config = ClientConfig::default()
         .with_ssid(alloc::string::String::from(env!("WIFI_SSID")))
@@ -377,20 +458,12 @@ async fn main(_spawner: Spawner) {
         .with_auth_method(AuthMethod::WpaWpa2Personal);
     let mode_config = ModeConfig::Client(client_config);
     wifi_controller.set_config(&mode_config).expect("WiFi config failed");
-    wifi_controller.start().expect("WiFi start failed");
-    println!("[WIFI] Connecting...");
+    // NOTE: we do NOT call wifi_controller.start() here. The radio stays
+    // fully idle until the user taps the WiFi button.
 
-    // Connect async (non-blocking)
-    match wifi_controller.connect_async().await {
-        Ok(()) => println!("[WIFI] Connected!"),
-        Err(e) => println!("[WIFI] Connect failed: {:?}", e),
-    }
-
-    // === Network Stack (DHCP) ===
-    println!("[WIFI] Setting up network stack...");
-    use embassy_net::{Config as NetConfig, StackResources, Runner};
+    // === Network Stack scaffolding (idle until radio starts) ===
+    use embassy_net::{Config as NetConfig, StackResources};
     use static_cell::StaticCell;
-use embassy_time::with_timeout;
 
     let net_config = NetConfig::dhcpv4(Default::default());
     static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
@@ -398,37 +471,22 @@ use embassy_time::with_timeout;
 
     let (stack, runner) = embassy_net::new(wifi_interfaces.sta, net_config, resources, 12345u64);
 
-    // Spawn network runner task
+    // Spawn network runner task. It does nothing useful until the radio
+    // has been started, but spawning it here avoids having to hot-spawn
+    // a task from inside the main loop.
     _spawner.spawn(net_task(runner)).ok();
 
-    // Wait for DHCP IP
-    println!("[WIFI] Waiting for DHCP...");
-    loop {
-        if let Some(config) = stack.config_v4() {
-            println!("[WIFI] IP: {}", config.address);
-            break;
-        }
-        Timer::after(Duration::from_millis(100)).await;
-    }
-
-    // === NTP Time Sync ===
-    // Simple NTP: connect to pool.ntp.org:123 and get time
-    println!("[NTP] Syncing time...");
-    match ntp_sync(stack, &mut rtc).await {
-        Ok(()) => println!("[NTP] Time synced!"),
-        Err(()) => println!("[NTP] Sync failed (using RTC time)"),
-    }
-
-    // BLE init removed: btdm_controller_init panics (-4) when coexisting with WiFi
-    // without coex config. We don't use BLE features yet anyway.
-
     let mut boot_button = Input::new(peripherals.GPIO0, InputConfig::default().with_pull(Pull::Up));
-    println!("=== All systems GO! (Embassy async) ===");
+    println!("=== All systems GO! (Embassy async, WiFi OFF) ===");
 
     // === State ===
     let mut watchface = WatchFace::new();
-    watchface.wifi_connected = true; // WiFi already connected at this point
+    watchface.wifi_connected = false; // radio stays off until user taps the button
     let mut current_page = Page::Clock;
+    // Live power-diagnostic snapshot, updated in the main loop and read
+    // by the Power page renderer. Kept as plain POD so reading it is free.
+    let mut power_stats = PowerStats::new();
+    power_stats.cpu_mhz = 160;
     let mut app_state = AppState::Watchface;
     let mut snake_game = SnakeGame::new();
     let mut game_2048 = Game2048::new();
@@ -496,9 +554,9 @@ use embassy_time::with_timeout;
     //   * watchface clock, gyro off : 1 s    (only the seconds digit changes)
     //   * watchface clock, gyro on  : 33 ms  (smooth gyro ball)
     //   * sensors page              : 100 ms (10 Hz IMU)
+    //   * power page                : 1 s    (diagnostic — must not self-skew)
     //   * launcher / settings / mp3 : 100 ms
-    //   * Snake / 2048 / Tetris / Maze : 16 ms (~60 Hz)
-    //   * Flappy                    : 8 ms   (high responsiveness for jumps)
+    //   * Snake / 2048 / Tetris / Maze / Flappy : 33 ms (~30 Hz, panel cap)
     //
     // A finger held on the screen forces 16 ms tick regardless of state.
     //
@@ -511,8 +569,18 @@ use embassy_time::with_timeout;
     let mut next_battery = Instant::now();
     let mut last_frame = Instant::now();
     let mut next_watchface_flush = Instant::now();
-    let mut wifi_connected = true;
+    // Radio state: we track both what the user *wants* and what the radio
+    // actually is. They drift apart briefly during connect/disconnect.
+    let mut wifi_on_request: bool = false;      // user toggle
+    let mut wifi_started: bool = false;         // controller.start() called
+    let mut wifi_connected: bool = false;       // connect_async succeeded
+    let mut ntp_synced: bool = false;
     let mut last_wifi_idle_check = Instant::now();
+    // Request pending from a UI tap on the WiFi button.
+    let mut wifi_toggle_request: bool = false;
+    // BLE state
+    let mut ble_on: bool = false;
+    let mut ble_toggle_request: bool = false;
     // Power-down the IMU at boot — only enable when a consumer (gyro toggle, game, sensors page) needs it.
     let _ = imu.power_down();
     let mut imu_powered = false;
@@ -551,12 +619,18 @@ use embassy_time::with_timeout;
                     },
                     Page::Sensors => Duration::from_millis(100), // 10 Hz IMU display
                     Page::System  => Duration::from_secs(2),     // basically static
+                    // Power page refreshes at 1 Hz — fast enough to see
+                    // changes, slow enough not to skew the measurement.
+                    Page::Power   => Duration::from_secs(1),
                 },
                 AppState::Launcher | AppState::Settings | AppState::Mp3Player
                 | AppState::SmartHome => Duration::from_millis(100),
-                AppState::Flappy => Duration::from_millis(8),
+                // Flappy previously ran at 8 ms (~125 Hz). The panel can't
+                // even display that (VSync is ~33 ms) so the extra ticks
+                // just burned CPU and DMA for no visible benefit.
+                AppState::Flappy => Duration::from_millis(33),
                 AppState::Snake | AppState::Game2048 | AppState::Tetris
-                | AppState::Maze => Duration::from_millis(16),
+                | AppState::Maze => Duration::from_millis(33),
             }
         };
 
@@ -626,9 +700,11 @@ use embassy_time::with_timeout;
                 watchface.update_battery(batt_pct, batt_mv, charging);
             }
             next_battery = if screen_state == 0 {
-                now + Duration::from_secs(300)
+                now + Duration::from_secs(600)
             } else {
-                now + Duration::from_secs(60)
+                // Battery percent rarely changes faster than every few
+                // minutes; polling every 60 s was pure I²C overhead.
+                now + Duration::from_secs(180)
             };
         }
 
@@ -651,7 +727,12 @@ use embassy_time::with_timeout;
                 if let Some(tp) = point {
                     last_touch_x = tp.x;
                     last_touch_y = tp.y;
-                    if !swiping {
+                    // Don't start a page swipe if the finger is on the
+                    // brightness slider — horizontal drag there adjusts
+                    // brightness, not pages.
+                    let on_slider = current_page == Page::Clock
+                        && WatchFace::brightness_from_tap(tp.x, tp.y).is_some();
+                    if !swiping && !on_slider {
                         if swipe_start_x == 0 { swipe_start_x = tp.x as i32; }
                         else {
                             let dx = tp.x as i32 - swipe_start_x;
@@ -666,11 +747,18 @@ use embassy_time::with_timeout;
                                         let mut wf2 = WatchFace::new();
                                         if let Ok(dt) = rtc.get_time() { wf2.update_time(dt.hours, dt.minutes, dt.seconds); }
                                         wf2.update_battery(batt_pct, batt_mv, charging);
+                                        wf2.wifi_connected = wifi_connected;
                                         wf2.force_redraw();
                                         let _ = wf2.render(&mut fb);
                                     }
                                     Page::Sensors => { let _ = pages::draw_sensors_page(&mut fb, 0,0,0,0,0,0,0); }
                                     Page::System => { let _ = pages::draw_system_page(&mut fb, batt_mv, batt_pct, charging); }
+                                    Page::Power => {
+                                        update_power_stats(&mut power_stats, screen_state, imu_powered,
+                                            wifi_connected, wifi_on_request, watchface.brightness,
+                                            batt_mv, batt_pct, charging);
+                                        let _ = power_page::draw_power_page(&mut fb, &power_stats);
+                                    }
                                 }
                                 snap_target.copy_from_slice(fb.buffer());
                             }
@@ -758,7 +846,8 @@ use embassy_time::with_timeout;
                     display.display_on();
                     Timer::after(Duration::from_millis(20)).await;
                 }
-                display.set_brightness(0xD0);
+                // Restore the user's chosen brightness from the slider.
+                display.set_brightness(watchface.brightness);
                 screen_state = 3;
                 next_watchface_flush = now;
                 if app_state == AppState::Watchface {
@@ -768,13 +857,13 @@ use embassy_time::with_timeout;
             }
         }
         let idle_secs = (now - last_interaction).as_secs();
-        // 10 min in AOD → fully off
-        if idle_secs >= 600 && screen_state > 0 {
+        // 3 min in AOD → fully off (was 10 min — aggressive saves ~8 mA×7 min)
+        if idle_secs >= 180 && screen_state > 0 {
             display.set_brightness(0x00);
             display.display_off();
             screen_state = 0;
-        // 40 s idle → AOD (only when on the watchface — in apps we just dim/off)
-        } else if idle_secs >= 40 && screen_state > 1 {
+        // 15 s idle → AOD (was 40 s — faster dim saves ~45 mA×25 s every cycle)
+        } else if idle_secs >= 15 && screen_state > 1 {
             if app_state == AppState::Watchface && current_page == Page::Clock {
                 display.set_brightness(0x18); // very dim, ~10% of normal
                 screen_state = 1;
@@ -785,33 +874,117 @@ use embassy_time::with_timeout;
                 display.display_off();
                 screen_state = 0;
             }
-        // 20 s idle → dim transition
-        } else if idle_secs >= 20 && screen_state > 2 {
+        // 8 s idle → dim transition (was 20 s)
+        } else if idle_secs >= 8 && screen_state > 2 {
             display.set_brightness(0x40);
             screen_state = 2;
         }
 
-        // === WiFi auto-disconnect after long idle ===
-        // The 2.4 GHz radio is the single biggest constant drain on the watch.
-        // After 5 minutes of inactivity, drop the connection. The user can wake
-        // the screen and we'll reconnect on next interaction (handled below).
-        if wifi_connected && idle_secs >= 300
-            && (now - last_wifi_idle_check).as_secs() >= 60 {
+        // === WiFi on/off state machine ===
+        //
+        // We take exactly one action per loop iteration so we don't block
+        // the UI during a long-running connect_async(). User wants (wifi_on_request)
+        // is driven by tapping the 'W' button on the watchface.
+        //
+        // On enable:  start() -> connect_async() -> set_power_save(MaxModem) -> NTP (once)
+        // On disable: disconnect_async() -> stop()
+        //
+        // An "auto-off after 5 minutes idle" safety net is kept so that if
+        // the user leaves WiFi enabled and wanders off, the radio drops on
+        // its own. Turning it back on is manual — intentional.
+        // Debounce the WiFi button: ignore rapid re-taps within 1 s.
+        if wifi_toggle_request && (now - last_wifi_idle_check).as_millis() >= 1000 {
+            wifi_on_request = !wifi_on_request;
+            wifi_toggle_request = false;
             last_wifi_idle_check = now;
-            if wifi_controller.disconnect_async().await.is_ok() {
-                println!("[WIFI] Disconnected (idle >5min, saving power)");
-                wifi_connected = false;
-                watchface.wifi_connected = false;
-            }
+            println!("[WIFI] User toggled → {}", if wifi_on_request { "ON" } else { "OFF" });
+        } else if wifi_toggle_request {
+            wifi_toggle_request = false; // swallow the bounce
         }
-        // Reconnect when the user wakes the screen back up to full bright
-        if !wifi_connected && screen_state == 3 && (now - last_wifi_idle_check).as_secs() >= 5 {
-            last_wifi_idle_check = now;
-            if wifi_controller.connect_async().await.is_ok() {
-                println!("[WIFI] Reconnected on wake");
-                wifi_connected = true;
-                watchface.wifi_connected = true;
+
+        if wifi_on_request && !wifi_connected {
+            if !wifi_started {
+                if wifi_controller.start().is_ok() {
+                    wifi_started = true;
+                }
             }
+            if wifi_started {
+                // 8 s timeout — avoids blocking the UI forever if AP
+                // is unreachable or credentials are wrong.
+                match embassy_time::with_timeout(
+                    Duration::from_secs(8),
+                    wifi_controller.connect_async(),
+                ).await {
+                    Ok(Ok(())) => {
+                        println!("[WIFI] Connected (PS=MaxModem)");
+                        wifi_connected = true;
+                        watchface.wifi_connected = true;
+                        watchface.force_redraw();
+                        page_dirty = true;
+                        // NTP sync only once per boot, after DHCP lands.
+                        if !ntp_synced {
+                            for _ in 0..30 {
+                                if stack.config_v4().is_some() { break; }
+                                Timer::after(Duration::from_millis(100)).await;
+                            }
+                            if stack.config_v4().is_some() {
+                                if ntp_sync(stack, &mut rtc).await.is_ok() {
+                                    ntp_synced = true;
+                                    println!("[NTP] synced");
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        // Timeout or error — back off instead of hammering.
+                        println!("[WIFI] Connect failed/timeout");
+                        wifi_on_request = false;
+                        watchface.wifi_connected = false;
+                        watchface.force_redraw();
+                        page_dirty = true;
+                    }
+                }
+            }
+            last_wifi_idle_check = now;
+        }
+        if !wifi_on_request && wifi_connected {
+            let _ = wifi_controller.disconnect_async().await;
+            println!("[WIFI] Disconnected");
+            wifi_connected = false;
+            watchface.wifi_connected = false;
+            let _ = wifi_controller.stop();
+            wifi_started = false;
+            watchface.force_redraw();
+            page_dirty = true;
+            last_wifi_idle_check = now;
+        }
+        // Safety net: WiFi left on, user idle 5 min → auto-off.
+        if wifi_on_request && idle_secs >= 300
+            && (now - last_wifi_idle_check).as_secs() >= 60 {
+            wifi_on_request = false;
+            last_wifi_idle_check = now;
+        }
+
+        // === BLE state machine ===
+        if ble_toggle_request {
+            ble_toggle_request = false;
+            ble_on = !ble_on;
+            if ble_on {
+                match crate::peripherals::ble::start_advertising(&mut ble_connector) {
+                    Ok(()) => println!("[BLE] Advertising started"),
+                    Err(_) => {
+                        println!("[BLE] Failed to start advertising");
+                        ble_on = false;
+                    }
+                }
+            } else {
+                let _ = crate::peripherals::ble::stop_advertising(&mut ble_connector);
+                println!("[BLE] Advertising stopped");
+            }
+            watchface.ble_on = ble_on;
+            power_stats.ble_on = ble_on;
+            watchface.force_redraw();
+            page_dirty = true;
         }
 
         // === AOD render path ===
@@ -850,6 +1023,16 @@ use embassy_time::with_timeout;
                         match current_page {
                             Page::Clock => { watchface.force_redraw(); }
                             Page::System => { let _ = pages::draw_system_page(&mut fb, batt_mv, batt_pct, charging); }
+                            Page::Power => {
+                                // Rebuild stats snapshot, then render once.
+                                // Subsequent frames will only redraw every
+                                // ~1 s (see below) to keep the diagnostic
+                                // itself cheap.
+                                update_power_stats(&mut power_stats, screen_state, imu_powered,
+                                    wifi_connected, wifi_on_request, watchface.brightness,
+                                    batt_mv, batt_pct, charging);
+                                let _ = power_page::draw_power_page(&mut fb, &power_stats);
+                            }
                             _ => {}
                         }
                         page_dirty = false;
@@ -872,6 +1055,19 @@ use embassy_time::with_timeout;
                             let _ = pages::draw_sensors_page(&mut fb, ax, ay, az, gyro_data.0, gyro_data.1, gyro_data.2, imu_temp);
                             need_flush = true;
                         }
+                        Page::Power => {
+                            // Refresh the snapshot + redraw at ~1 Hz. Any faster
+                            // and the diagnostic itself starts to skew the
+                            // measurement it's supposed to report.
+                            if now >= next_watchface_flush {
+                                update_power_stats(&mut power_stats, screen_state, imu_powered,
+                                    wifi_connected, wifi_on_request, watchface.brightness,
+                                    batt_mv, batt_pct, charging);
+                                let _ = power_page::draw_power_page(&mut fb, &power_stats);
+                                need_flush = true;
+                                next_watchface_flush = now + Duration::from_secs(1);
+                            }
+                        }
                         Page::System => {} // Static, already rendered
                     }
                     // Only flush if we actually drew something. The TE wait + 402 KB DMA
@@ -883,11 +1079,53 @@ use embassy_time::with_timeout;
                     }
                 }
 
-                // Tap on gyro zone → toggle gyro
-                if tap_event && current_page == Page::Clock {
-                    if WatchFace::is_gyro_zone(last_touch_y) {
-                        let enabled = watchface.toggle_gyro();
-                        println!("Gyro: {}", if enabled { "ON" } else { "OFF" });
+                // Tap/touch dispatch on the Clock page.
+                if current_page == Page::Clock {
+                    // Brightness slider — responds to both taps and held
+                    // drags so you can slide your finger along it.
+                    if let Some(bri) = WatchFace::brightness_from_tap(last_touch_x, last_touch_y) {
+                        if (touch_int.is_low() || tap_event) && bri != watchface.brightness {
+                            watchface.brightness = bri;
+                            display.set_brightness(bri);
+                            watchface.force_redraw();
+                            page_dirty = true;
+                        }
+                    } else if tap_event {
+                        // BLE toggle
+                        if WatchFace::is_ble_zone(last_touch_x, last_touch_y) {
+                            ble_toggle_request = true;
+                            watchface.force_redraw();
+                            page_dirty = true;
+                        // WiFi toggle
+                        } else if WatchFace::is_wifi_zone(last_touch_x, last_touch_y) {
+                            wifi_toggle_request = true;
+                            watchface.force_redraw();
+                            page_dirty = true;
+                        // CPU frequency cycle (live DVFS)
+                        } else if WatchFace::is_cpu_zone(last_touch_x, last_touch_y) {
+                            watchface.cycle_cpu();
+                            let actual = crate::peripherals::cpu_clock::set_cpu_mhz(watchface.cpu_mhz);
+                            watchface.cpu_mhz = actual;
+                            power_stats.cpu_mhz = actual;
+                            println!("CPU freq: {}MHz (live)", actual);
+                            watchface.force_redraw();
+                            page_dirty = true;
+                        // Apps launcher
+                        } else if WatchFace::is_apps_zone(last_touch_x, last_touch_y) {
+                            app_state = AppState::Launcher;
+                        // Gyro toggle
+                        } else if WatchFace::is_gyro_zone(last_touch_y) {
+                            let enabled = watchface.toggle_gyro();
+                            println!("Gyro: {}", if enabled { "ON" } else { "OFF" });
+                        }
+                    }
+                }
+
+                // Reboot button on Power page
+                if current_page == Page::Power && tap_event {
+                    if power_page::is_reboot_zone(last_touch_x, last_touch_y) {
+                        println!("REBOOT requested");
+                        esp_hal::system::software_reset();
                     }
                 }
 

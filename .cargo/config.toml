@@ -9,5 +9,8 @@ rustflags = ["-C", "link-arg=-Tlinkall.x"]
 build-std = ["core", "alloc"]
 
 [env]
-ESP_LOG = "info"
+# "error" silences the harmless esp_wifi_internal_tx warnings that fire
+# when the network runner task tries to send DHCP DISCOVER before the radio
+# is started. Set back to "info" or "warn" for debugging.
+ESP_LOG = "error"
 ESP_HAL_CONFIG_PSRAM_MODE = "octal"

@@ -28,6 +28,37 @@ const GYRO_R: i32 = 50;
 const BALL_R: i32 = 8;
 const GYRO_FLUSH_PAD: i32 = 2;
 
+// BLE toggle switch geometry (above WiFi)
+const BLE_TOGGLE_X: i32 = 50;
+const BLE_TOGGLE_Y: i32 = 245;
+const BLE_TOGGLE_W: i32 = 56;
+const BLE_TOGGLE_H: i32 = 28;
+
+// WiFi toggle switch geometry (iOS-style pill)
+const WIFI_TOGGLE_X: i32 = 50;
+const WIFI_TOGGLE_Y: i32 = 290;
+const WIFI_TOGGLE_W: i32 = 56;
+const WIFI_TOGGLE_H: i32 = 28;
+const WIFI_KNOB_R: i32 = 10;
+
+// Brightness slider geometry
+const BRI_SLIDER_X: i32 = 160;
+const BRI_SLIDER_Y: i32 = 278;
+const BRI_SLIDER_W: i32 = 180;
+const BRI_SLIDER_H: i32 = 22;
+
+// CPU freq button geometry (below WiFi toggle)
+const CPU_BTN_X: i32 = 42;
+const CPU_BTN_Y: i32 = 327;
+const CPU_BTN_W: i32 = 72;
+const CPU_BTN_H: i32 = 28;
+
+// Apps button geometry (bottom center, replaces "100% Rust" footer)
+const APPS_BTN_X: i32 = 130;
+const APPS_BTN_Y: i32 = 450;
+const APPS_BTN_W: i32 = 140;
+const APPS_BTN_H: i32 = 32;
+
 #[derive(Clone, Copy, Debug)]
 pub struct FlushRegion {
     pub x: u16,
@@ -71,7 +102,13 @@ pub struct WatchFace {
     day: u8, month: u8, year: u8,
     full_redraw: bool, time_changed: bool, battery_changed: bool, gyro_changed: bool,
     pub wifi_connected: bool,
+    pub ble_on: bool,
     pub gyro_enabled: bool,
+    /// Display brightness 0..255, controlled by the slider on the watchface.
+    pub brightness: u8,
+    /// CPU frequency in MHz. Cycles through 80/160/240 on tap.
+    /// Only takes effect on next reboot (esp-hal doesn't expose runtime DVFS).
+    pub cpu_mhz: u16,
 }
 
 impl WatchFace {
@@ -84,7 +121,10 @@ impl WatchFace {
             day: 6, month: 4, year: 26,
             full_redraw: true, time_changed: false, battery_changed: false, gyro_changed: false,
             wifi_connected: false,
+            ble_on: false,
             gyro_enabled: false, // off by default to save battery
+            brightness: 0xA0,   // default ~63%
+            cpu_mhz: 160,
         }
     }
 
@@ -130,6 +170,313 @@ impl WatchFace {
     /// Check if tap is in gyro zone
     pub fn is_gyro_zone(y: u16) -> bool {
         y as i32 >= GYRO_CY - GYRO_R - 20 && (y as i32) <= GYRO_CY + GYRO_R + 20
+    }
+
+    /// Hit-test for the WiFi toggle switch.
+    pub fn is_wifi_zone(x: u16, y: u16) -> bool {
+        let xi = x as i32;
+        let yi = y as i32;
+        xi >= WIFI_TOGGLE_X - 10
+            && xi <= WIFI_TOGGLE_X + WIFI_TOGGLE_W + 10
+            && yi >= WIFI_TOGGLE_Y - 10
+            && yi <= WIFI_TOGGLE_Y + WIFI_TOGGLE_H + 10
+    }
+
+    /// Hit-test for the brightness slider. Returns Some(brightness 0..255)
+    /// based on horizontal position, or None if tap is outside.
+    pub fn brightness_from_tap(x: u16, y: u16) -> Option<u8> {
+        let xi = x as i32;
+        let yi = y as i32;
+        if yi >= BRI_SLIDER_Y - 12
+            && yi <= BRI_SLIDER_Y + BRI_SLIDER_H + 12
+            && xi >= BRI_SLIDER_X - 10
+            && xi <= BRI_SLIDER_X + BRI_SLIDER_W + 10
+        {
+            let clamped = (xi - BRI_SLIDER_X).clamp(0, BRI_SLIDER_W) as u32;
+            // Map 0..BRI_SLIDER_W → 0x10..0xFF (never fully off via slider)
+            let val = 0x10 + (clamped * (0xFF - 0x10) as u32 / BRI_SLIDER_W as u32);
+            Some(val as u8)
+        } else {
+            None
+        }
+    }
+
+    /// Draw a WiFi icon (3 concentric arcs + dot) using rectangles.
+    /// The icon is ~16x14 pixels, top-left at (x, y).
+    fn draw_wifi_icon<D: DrawTarget<Color = Rgb565>>(
+        d: &mut D,
+        x: i32,
+        y: i32,
+        color: Rgb565,
+    ) -> Result<(), D::Error> {
+        let px = |dx: i32, dy: i32, w: u32, h: u32| {
+            Rectangle::new(Point::new(x + dx, y + dy), Size::new(w, h))
+                .into_styled(PrimitiveStyle::with_fill(color))
+        };
+        // Dot (center bottom)
+        px(7, 12, 2, 2).draw(d)?;
+        // Arc 1 (smallest)
+        px(5, 9, 6, 1).draw(d)?;
+        px(4, 8, 1, 1).draw(d)?;
+        px(11, 8, 1, 1).draw(d)?;
+        // Arc 2 (middle)
+        px(3, 5, 10, 1).draw(d)?;
+        px(2, 4, 1, 1).draw(d)?;
+        px(13, 4, 1, 1).draw(d)?;
+        // Arc 3 (largest)
+        px(1, 1, 14, 1).draw(d)?;
+        px(0, 0, 1, 1).draw(d)?;
+        px(15, 0, 1, 1).draw(d)?;
+        Ok(())
+    }
+
+    /// Draw a Bluetooth rune icon (~10x16 pixels) at (x, y).
+    fn draw_ble_icon<D: DrawTarget<Color = Rgb565>>(
+        d: &mut D,
+        x: i32,
+        y: i32,
+        color: Rgb565,
+    ) -> Result<(), D::Error> {
+        let px = |dx: i32, dy: i32, w: u32, h: u32| {
+            Rectangle::new(Point::new(x + dx, y + dy), Size::new(w, h))
+                .into_styled(PrimitiveStyle::with_fill(color))
+        };
+        // Vertical line (center)
+        px(5, 0, 1, 16).draw(d)?;
+        // Top arrow (pointing right-up): line going from center-top to right
+        px(6, 1, 1, 1).draw(d)?;
+        px(7, 2, 1, 1).draw(d)?;
+        px(8, 3, 1, 1).draw(d)?;
+        // Arrow comes back to center at ~y+5
+        px(7, 4, 1, 1).draw(d)?;
+        px(6, 5, 1, 1).draw(d)?;
+        // Cross line top-left to mid-right
+        px(1, 4, 1, 1).draw(d)?;
+        px(2, 5, 1, 1).draw(d)?;
+        px(3, 6, 1, 1).draw(d)?;
+        px(4, 7, 1, 1).draw(d)?;
+        // Cross line bottom-left to mid-right
+        px(4, 8, 1, 1).draw(d)?;
+        px(3, 9, 1, 1).draw(d)?;
+        px(2, 10, 1, 1).draw(d)?;
+        px(1, 11, 1, 1).draw(d)?;
+        // Bottom arrow
+        px(6, 10, 1, 1).draw(d)?;
+        px(7, 11, 1, 1).draw(d)?;
+        px(8, 12, 1, 1).draw(d)?;
+        px(7, 13, 1, 1).draw(d)?;
+        px(6, 14, 1, 1).draw(d)?;
+        Ok(())
+    }
+
+    /// Draw the iOS-style BLE toggle pill (above WiFi).
+    fn draw_ble_toggle<D: DrawTarget<Color = Rgb565>>(
+        d: &mut D,
+        on: bool,
+    ) -> Result<(), D::Error> {
+        let x = BLE_TOGGLE_X;
+        let y = BLE_TOGGLE_Y;
+        let w = BLE_TOGGLE_W;
+        let h = BLE_TOGGLE_H;
+        let r = h / 2;
+        let kr = 10i32;
+
+        let track_color = if on { Rgb565::new(0, 16, 31) } else { Rgb565::new(6, 12, 6) }; // blue when on
+        RoundedRectangle::with_equal_corners(
+            Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32)),
+            Size::new(r as u32, r as u32),
+        ).into_styled(PrimitiveStyle::with_fill(track_color)).draw(d)?;
+
+        let knob_cx = if on { x + w - r } else { x + r };
+        let knob_cy = y + h / 2;
+        Circle::new(
+            Point::new(knob_cx - kr, knob_cy - kr),
+            (kr * 2) as u32,
+        ).into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE)).draw(d)?;
+
+        let dim = MonoTextStyle::new(&FONT_10X20, Rgb565::CSS_GRAY);
+        Text::new("BLE", Point::new(x + 4, y - 4), dim).draw(d)?;
+
+        Ok(())
+    }
+
+    /// Draw the iOS-style WiFi toggle pill.
+    fn draw_wifi_toggle<D: DrawTarget<Color = Rgb565>>(
+        d: &mut D,
+        connected: bool,
+    ) -> Result<(), D::Error> {
+        let x = WIFI_TOGGLE_X;
+        let y = WIFI_TOGGLE_Y;
+        let w = WIFI_TOGGLE_W;
+        let h = WIFI_TOGGLE_H;
+        let r = h / 2;
+
+        // Track (pill shape = rounded rectangle with half-height corners)
+        let track_color = if connected { Rgb565::GREEN } else { Rgb565::new(6, 12, 6) };
+        RoundedRectangle::with_equal_corners(
+            Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32)),
+            Size::new(r as u32, r as u32),
+        ).into_styled(PrimitiveStyle::with_fill(track_color)).draw(d)?;
+
+        // Knob (white circle, left when off, right when on)
+        let knob_cx = if connected {
+            x + w - r
+        } else {
+            x + r
+        };
+        let knob_cy = y + h / 2;
+        Circle::new(
+            Point::new(knob_cx - WIFI_KNOB_R, knob_cy - WIFI_KNOB_R),
+            (WIFI_KNOB_R * 2) as u32,
+        ).into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE)).draw(d)?;
+
+        // Label
+        let dim = MonoTextStyle::new(&FONT_10X20, Rgb565::CSS_GRAY);
+        Text::new("WiFi", Point::new(x + 2, y - 4), dim).draw(d)?;
+
+        Ok(())
+    }
+
+    /// Draw the CPU frequency button with "CPU" label underneath.
+    fn draw_cpu_button<D: DrawTarget<Color = Rgb565>>(
+        d: &mut D,
+        mhz: u16,
+    ) -> Result<(), D::Error> {
+        // Rounded pill button
+        let color = match mhz {
+            80 => Rgb565::new(0, 12, 4),   // greenish = eco
+            240 => Rgb565::new(15, 6, 0),  // orange = performance
+            _ => Rgb565::new(4, 8, 12),    // blue = balanced
+        };
+        RoundedRectangle::with_equal_corners(
+            Rectangle::new(
+                Point::new(CPU_BTN_X, CPU_BTN_Y),
+                Size::new(CPU_BTN_W as u32, CPU_BTN_H as u32),
+            ),
+            Size::new(8, 8),
+        ).into_styled(PrimitiveStyle::with_fill(color)).draw(d)?;
+
+        // Text: "80M" / "160M" / "240M"
+        let mut buf = [0u8; 5];
+        let s = fmt_mhz_short(&mut buf, mhz);
+        let ts = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
+        Text::with_alignment(
+            s,
+            Point::new(CPU_BTN_X + CPU_BTN_W / 2, CPU_BTN_Y + 20),
+            ts,
+            Alignment::Center,
+        ).draw(d)?;
+
+        // "CPU" label below button
+        let dim = MonoTextStyle::new(&FONT_10X20, Rgb565::CSS_GRAY);
+        Text::with_alignment(
+            "CPU",
+            Point::new(CPU_BTN_X + CPU_BTN_W / 2, CPU_BTN_Y + CPU_BTN_H + 16),
+            dim,
+            Alignment::Center,
+        ).draw(d)?;
+        Ok(())
+    }
+
+    /// Draw the Apps launcher button (bottom center).
+    fn draw_apps_button<D: DrawTarget<Color = Rgb565>>(d: &mut D) -> Result<(), D::Error> {
+        RoundedRectangle::with_equal_corners(
+            Rectangle::new(
+                Point::new(APPS_BTN_X, APPS_BTN_Y),
+                Size::new(APPS_BTN_W as u32, APPS_BTN_H as u32),
+            ),
+            Size::new(12, 12),
+        ).into_styled(PrimitiveStyle::with_fill(Rgb565::new(4, 8, 14))).draw(d)?;
+
+        let ts = MonoTextStyle::new(&FONT_10X20, Rgb565::WHITE);
+        Text::with_alignment(
+            "APPS",
+            Point::new(APPS_BTN_X + APPS_BTN_W / 2, APPS_BTN_Y + 24),
+            ts,
+            Alignment::Center,
+        ).draw(d)?;
+        Ok(())
+    }
+
+    /// Hit-test for the BLE toggle switch.
+    pub fn is_ble_zone(x: u16, y: u16) -> bool {
+        let xi = x as i32;
+        let yi = y as i32;
+        xi >= BLE_TOGGLE_X - 10 && xi <= BLE_TOGGLE_X + BLE_TOGGLE_W + 10
+            && yi >= BLE_TOGGLE_Y - 10 && yi <= BLE_TOGGLE_Y + BLE_TOGGLE_H + 10
+    }
+
+    /// Hit-test for the CPU frequency button.
+    pub fn is_cpu_zone(x: u16, y: u16) -> bool {
+        let xi = x as i32;
+        let yi = y as i32;
+        xi >= CPU_BTN_X - 8 && xi <= CPU_BTN_X + CPU_BTN_W + 8
+            && yi >= CPU_BTN_Y - 8 && yi <= CPU_BTN_Y + CPU_BTN_H + 8
+    }
+
+    /// Hit-test for the Apps button.
+    pub fn is_apps_zone(x: u16, y: u16) -> bool {
+        let xi = x as i32;
+        let yi = y as i32;
+        xi >= APPS_BTN_X - 8 && xi <= APPS_BTN_X + APPS_BTN_W + 8
+            && yi >= APPS_BTN_Y - 8 && yi <= APPS_BTN_Y + APPS_BTN_H + 8
+    }
+
+    /// Cycle CPU frequency: 80 → 160 → 240 → 80.
+    pub fn cycle_cpu(&mut self) -> u16 {
+        self.cpu_mhz = match self.cpu_mhz {
+            80 => 160,
+            160 => 240,
+            _ => 80,
+        };
+        self.full_redraw = true;
+        self.cpu_mhz
+    }
+
+    /// Draw the horizontal brightness slider.
+    fn draw_brightness_slider<D: DrawTarget<Color = Rgb565>>(
+        d: &mut D,
+        brightness: u8,
+    ) -> Result<(), D::Error> {
+        let x = BRI_SLIDER_X;
+        let y = BRI_SLIDER_Y;
+        let w = BRI_SLIDER_W;
+        let h = BRI_SLIDER_H;
+
+        // Label
+        let dim = MonoTextStyle::new(&FONT_10X20, Rgb565::CSS_GRAY);
+        Text::new("Bri", Point::new(x - 2, y - 4), dim).draw(d)?;
+
+        // Track background (dark gray pill)
+        RoundedRectangle::with_equal_corners(
+            Rectangle::new(Point::new(x, y), Size::new(w as u32, h as u32)),
+            Size::new((h / 2) as u32, (h / 2) as u32),
+        ).into_styled(PrimitiveStyle::with_fill(Rgb565::new(3, 6, 3))).draw(d)?;
+
+        // Filled portion (proportional to brightness)
+        let fill_w = ((brightness as i32 - 0x10).max(0) * w / (0xFF - 0x10)) as u32;
+        if fill_w > 0 {
+            let fill_color = if brightness > 180 {
+                Rgb565::YELLOW
+            } else {
+                Rgb565::new(16, 32, 16) // soft green
+            };
+            RoundedRectangle::with_equal_corners(
+                Rectangle::new(Point::new(x, y), Size::new(fill_w.min(w as u32), h as u32)),
+                Size::new((h / 2) as u32, (h / 2) as u32),
+            ).into_styled(PrimitiveStyle::with_fill(fill_color)).draw(d)?;
+        }
+
+        // Thumb knob
+        let knob_x = x + fill_w as i32;
+        let knob_cy = y + h / 2;
+        let kr = h / 2 + 2;
+        Circle::new(
+            Point::new(knob_x - kr, knob_cy - kr),
+            (kr * 2) as u32,
+        ).into_styled(PrimitiveStyle::with_fill(Rgb565::WHITE)).draw(d)?;
+
+        Ok(())
     }
 
     pub fn needs_render(&self) -> bool {
@@ -192,7 +539,6 @@ impl WatchFace {
         let cx = SCREEN_CX;
 
         let cyan = MonoTextStyle::new(&FONT_10X20, Rgb565::CYAN);
-        let yellow = MonoTextStyle::new(&FONT_10X20, Rgb565::YELLOW);
         let dim = MonoTextStyle::new(&FONT_10X20, Rgb565::CSS_GRAY);
 
         if self.full_redraw {
@@ -201,11 +547,27 @@ impl WatchFace {
                 .into_styled(PrimitiveStyle::with_fill(Rgb565::BLACK))
                 .draw(d)?;
 
-            // WiFi indicator (well inside rounded screen area)
-            let wifi_color = if self.wifi_connected { Rgb565::GREEN } else { Rgb565::RED };
-            Circle::new(Point::new(60, 14), 8)
-                .into_styled(PrimitiveStyle::with_fill(wifi_color))
-                .draw(d)?;
+            // Status icons top-left (inside rounded area)
+            // WiFi icon: 3 arcs + dot (pixel-drawn)
+            if self.wifi_connected {
+                Self::draw_wifi_icon(d, 72, 10, Rgb565::GREEN)?;
+            }
+            // BLE icon: rune-style "B" shape
+            if self.ble_on {
+                Self::draw_ble_icon(d, 96, 10, Rgb565::new(0, 16, 31))?;
+            }
+
+            // === BLE toggle (above WiFi) ===
+            Self::draw_ble_toggle(d, self.ble_on)?;
+
+            // === WiFi toggle switch (iOS-style pill) ===
+            Self::draw_wifi_toggle(d, self.wifi_connected)?;
+
+            // === CPU freq button (below WiFi toggle) ===
+            Self::draw_cpu_button(d, self.cpu_mhz)?;
+
+            // === Brightness slider (horizontal bar) ===
+            Self::draw_brightness_slider(d, self.brightness)?;
 
             // Title
             Text::with_alignment("RUST WATCH", Point::new(cx, 38), cyan, Alignment::Center).draw(d)?;
@@ -227,14 +589,14 @@ impl WatchFace {
                 Circle::new(Point::new(GYRO_CX - GYRO_R, GYRO_CY - GYRO_R), (GYRO_R * 2) as u32)
                     .into_styled(PrimitiveStyle::with_stroke(Rgb565::CSS_DARK_GRAY, 2))
                     .draw(d)?;
-                Text::with_alignment("GYRO", Point::new(GYRO_CX, GYRO_CY - GYRO_R - 10), dim, Alignment::Center).draw(d)?;
+                Text::with_alignment("GYRO", Point::new(GYRO_CX, GYRO_CY + GYRO_R + 20), dim, Alignment::Center).draw(d)?;
                 self.draw_gyro_ball(d)?;
             } else {
-                Text::with_alignment("TAP FOR GYRO", Point::new(GYRO_CX, GYRO_CY), dim, Alignment::Center).draw(d)?;
+                Text::with_alignment("TAP FOR GYRO", Point::new(GYRO_CX, GYRO_CY + GYRO_R + 20), dim, Alignment::Center).draw(d)?;
             }
 
-            // Footer
-            Text::with_alignment("100% Rust // ESP32-S3", Point::new(cx, h - 15), yellow, Alignment::Center).draw(d)?;
+            // Apps button (bottom center)
+            Self::draw_apps_button(d)?;
 
             self.full_redraw = false;
             self.time_changed = false;
@@ -369,6 +731,17 @@ impl WatchFace {
         let by = ((accel_x as i32) * max_off / 100).clamp(-max_off, max_off);
         (GYRO_CX + bx, GYRO_CY + by)
     }
+}
+
+fn fmt_mhz_short<'a>(buf: &'a mut [u8; 5], mhz: u16) -> &'a str {
+    let mut p = 0;
+    if mhz >= 100 {
+        buf[p] = b'0' + (mhz / 100) as u8; p += 1;
+    }
+    buf[p] = b'0' + ((mhz / 10) % 10) as u8; p += 1;
+    buf[p] = b'0' + (mhz % 10) as u8; p += 1;
+    buf[p] = b'M'; p += 1;
+    core::str::from_utf8(&buf[..p]).unwrap_or("?M")
 }
 
 fn fmt_date_fr<'a>(buf: &'a mut [u8; 12], d: u8, m: u8, y: u8) -> &'a str {

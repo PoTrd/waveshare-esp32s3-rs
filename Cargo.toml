@@ -30,12 +30,13 @@ embedded-hal = "1.0"
 embedded-hal-bus = "0.3"
 
 # WiFi / Networking
-esp-radio = { version = "0.17.0", features = ["esp32s3", "wifi", "unstable", "log-04"] }
+esp-radio = { version = "0.17.0", features = ["esp32s3", "wifi", "ble", "coex", "unstable", "log-04"] }
 embassy-net = { version = "0.9.0", features = ["dhcpv4", "medium-ethernet", "tcp", "udp", "dns"] }
 
 # Peripheral drivers
 axp2101-embedded = "0.3"
 embedded-sdmmc = "0.8"
+embedded-io = "0.6"
 embedded-io-async = "0.6"
 
 # MP3 decoding
