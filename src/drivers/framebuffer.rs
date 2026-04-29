@@ -1,6 +1,4 @@
-// PSRAM Framebuffer for CO5300 display
-// 410x502 RGB565 = 411,640 bytes (~402KB)
-// Draws to RAM, then flushes entire screen via DMA QSPI
+// Simple RGB565 framebuffer for the 172x320 JD9853 panel.
 
 use embedded_graphics_core::draw_target::DrawTarget;
 use embedded_graphics_core::geometry::{OriginDimensions, Size};
@@ -10,8 +8,9 @@ use embedded_graphics_core::prelude::*;
 use embedded_graphics_core::primitives::Rectangle;
 
 use crate::board;
-use crate::drivers::co5300::Co5300Display;
-use crate::drivers::co5300::DisplayError;
+use crate::drivers::jd9853::DisplayError;
+use crate::drivers::jd9853::Jd9853Display;
+use crate::screen::{logical_size, map_logical_to_physical, Orientation};
 
 use alloc::vec;
 use alloc::vec::Vec;
@@ -22,131 +21,41 @@ const PIXEL_COUNT: usize = WIDTH * HEIGHT;
 
 pub struct Framebuffer {
     buf: Vec<u16>,
-    back: Vec<u16>, // Double buffer: draw to back, flush front
+    orientation: Orientation,
 }
 
 impl Framebuffer {
-    /// Allocate framebuffer in PSRAM (via global allocator).
-    pub fn new() -> Self {
+    pub fn new(orientation: Orientation) -> Self {
         let buf = vec![0u16; PIXEL_COUNT];
-        let back = vec![0u16; PIXEL_COUNT];
-        Self { buf, back }
+        Self { buf, orientation }
     }
 
-    /// Swap front and back buffers. Call after rendering to back buffer.
-    /// The front buffer (buf) is what gets flushed to display.
-    pub fn swap(&mut self) {
-        core::mem::swap(&mut self.buf, &mut self.back);
-    }
-
-    /// Clear the entire framebuffer with a color.
     pub fn clear_color(&mut self, color: Rgb565) {
         let raw = RawU16::from(color).into_inner();
         self.buf.fill(raw);
     }
 
-    /// Set a single pixel (no bounds check for speed).
-    #[inline(always)]
-    pub fn set_pixel(&mut self, x: usize, y: usize, color: u16) {
-        if x < WIDTH && y < HEIGHT {
-            self.buf[y * WIDTH + x] = color;
-        }
-    }
-
-    /// Fill a rectangular region.
     pub fn fill_rect(&mut self, x: usize, y: usize, w: usize, h: usize, color: u16) {
-        let x_end = (x + w).min(WIDTH);
-        let y_end = (y + h).min(HEIGHT);
+        let (logical_w, logical_h) = self.logical_size();
+        let x_end = (x + w).min(logical_w);
+        let y_end = (y + h).min(logical_h);
         for row in y..y_end {
-            let start = row * WIDTH + x;
-            let end = row * WIDTH + x_end;
-            self.buf[start..end].fill(color);
+            for col in x..x_end {
+                self.set_logical_pixel(col as i32, row as i32, color);
+            }
         }
     }
 
-    /// Double-buffer swap + VSync flush.
-    /// 1. Swap front/back buffers (instant)
-    /// 2. Wait for TE signal (VBlank)
-    /// 3. Flush the new front buffer to display
-    /// Result: display always shows a complete frame, zero tearing.
-    /// Fast VSync flush for games. No copy, just sync + send.
-    pub fn swap_and_flush(&mut self, display: &mut Co5300Display, te: &esp_hal::gpio::Input<'_>) {
-        // Short TE sync. If TE isn't pulsing (display just woken up, or we're flushing
-        // outside vblank window), give up after a few hundred cycles instead of burning
-        // CPU. Tearing is invisible most of the time anyway because we flush <30fps.
-        for _ in 0..400 { if te.is_high() { break; } }
+    pub fn flush(&self, display: &mut Jd9853Display) {
         display.set_addr_window(0, 0, WIDTH as u16, HEIGHT as u16);
         display.bus_mut().write_pixels(&self.buf);
-    }
-
-    /// VSync flush for watchface / menus. Same as swap_and_flush but kept distinct for clarity.
-    pub fn flush_vsync(&self, display: &mut Co5300Display, te: &esp_hal::gpio::Input<'_>) {
-        for _ in 0..400 { if te.is_high() { break; } }
-        self.flush(display);
-    }
-
-    /// Flush the entire framebuffer to the display via DMA QSPI.
-    pub fn flush(&self, display: &mut Co5300Display) {
-        display.set_addr_window(0, 0, WIDTH as u16, HEIGHT as u16);
-        display.bus_mut().write_pixels(&self.buf);
-    }
-
-    /// Flush only a rectangular region (dirty rect optimization).
-    pub fn flush_region(&self, display: &mut Co5300Display, x: u16, y: u16, w: u16, h: u16) {
-        if w == 0 || h == 0 {
-            return;
-        }
-
-        // The CO5300 is happier with even-aligned partial writes.
-        // Expand the dirty rect to an even 2x2-aligned region before streaming rows.
-        let mut x0 = (x as usize).min(WIDTH.saturating_sub(1));
-        let mut y0 = (y as usize).min(HEIGHT.saturating_sub(1));
-        let mut x1 = ((x as usize).saturating_add(w as usize)).min(WIDTH);
-        let mut y1 = ((y as usize).saturating_add(h as usize)).min(HEIGHT);
-
-        x0 &= !1;
-        y0 &= !1;
-        if x1 & 1 != 0 && x1 < WIDTH {
-            x1 += 1;
-        }
-        if y1 & 1 != 0 && y1 < HEIGHT {
-            y1 += 1;
-        }
-
-        if x1 <= x0 {
-            x1 = (x0 + 2).min(WIDTH);
-        }
-        if y1 <= y0 {
-            y1 = (y0 + 2).min(HEIGHT);
-        }
-
-        let flush_w = (x1 - x0).max(2).min(WIDTH - x0);
-        let flush_h = (y1 - y0).max(2).min(HEIGHT - y0);
-
-        display.set_addr_window(x0 as u16, y0 as u16, flush_w as u16, flush_h as u16);
-        display.bus_mut().begin_pixels();
-        for row in y0..(y0 + flush_h) {
-            let start = row * WIDTH + x0;
-            let end = start + flush_w;
-            display.bus_mut().stream_pixels(&self.buf[start..end]);
-        }
-        display.bus_mut().end_pixels();
-    }
-
-    /// Get raw buffer for direct access.
-    pub fn buffer(&self) -> &[u16] {
-        &self.buf
-    }
-
-    /// Get mutable raw buffer for direct access (snapshot restore).
-    pub fn buffer_mut(&mut self) -> &mut [u16] {
-        &mut self.buf
     }
 }
 
 impl OriginDimensions for Framebuffer {
     fn size(&self) -> Size {
-        Size::new(WIDTH as u32, HEIGHT as u32)
+        let (w, h) = logical_size(self.orientation);
+        Size::new(w as u32, h as u32)
     }
 }
 
@@ -159,10 +68,7 @@ impl DrawTarget for Framebuffer {
         I: IntoIterator<Item = Pixel<Self::Color>>,
     {
         for Pixel(coord, color) in pixels.into_iter() {
-            if coord.x >= 0 && coord.x < WIDTH as i32 && coord.y >= 0 && coord.y < HEIGHT as i32 {
-                let raw = RawU16::from(color).into_inner();
-                self.buf[coord.y as usize * WIDTH + coord.x as usize] = raw;
-            }
+            self.set_logical_pixel(coord.x, coord.y, RawU16::from(color).into_inner());
         }
         Ok(())
     }
@@ -175,10 +81,8 @@ impl DrawTarget for Framebuffer {
     where
         I: IntoIterator<Item = Self::Color>,
     {
-        let area = area.intersection(&Rectangle::new(
-            Point::zero(),
-            Size::new(WIDTH as u32, HEIGHT as u32),
-        ));
+        let (logical_w, logical_h) = logical_size(self.orientation);
+        let area = area.intersection(&Rectangle::new(Point::zero(), Size::new(logical_w as u32, logical_h as u32)));
         if area.size.width == 0 || area.size.height == 0 {
             return Ok(());
         }
@@ -190,8 +94,8 @@ impl DrawTarget for Framebuffer {
         let mut col = 0;
 
         for color in colors.into_iter() {
-            if col < w && row < HEIGHT {
-                self.buf[row * WIDTH + x + col] = RawU16::from(color).into_inner();
+            if col < w && row < logical_h as usize {
+                self.set_logical_pixel((x + col) as i32, row as i32, RawU16::from(color).into_inner());
             }
             col += 1;
             if col >= w {
@@ -207,10 +111,8 @@ impl DrawTarget for Framebuffer {
         area: &Rectangle,
         color: Self::Color,
     ) -> Result<(), Self::Error> {
-        let area = area.intersection(&Rectangle::new(
-            Point::zero(),
-            Size::new(WIDTH as u32, HEIGHT as u32),
-        ));
+        let (logical_w, logical_h) = logical_size(self.orientation);
+        let area = area.intersection(&Rectangle::new(Point::zero(), Size::new(logical_w as u32, logical_h as u32)));
         if area.size.width == 0 || area.size.height == 0 {
             return Ok(());
         }
@@ -223,5 +125,18 @@ impl DrawTarget for Framebuffer {
             raw,
         );
         Ok(())
+    }
+}
+
+impl Framebuffer {
+    fn logical_size(&self) -> (usize, usize) {
+        let (w, h) = logical_size(self.orientation);
+        (w as usize, h as usize)
+    }
+
+    fn set_logical_pixel(&mut self, x: i32, y: i32, color: u16) {
+        if let Some((px, py)) = map_logical_to_physical(x, y, self.orientation) {
+            self.buf[py * WIDTH + px] = color;
+        }
     }
 }

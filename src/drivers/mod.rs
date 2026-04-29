@@ -1,3 +1,3 @@
-pub mod co5300;
 pub mod framebuffer;
-pub mod qspi_bus;
+pub mod jd9853;
+pub mod spi_bus;

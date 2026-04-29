@@ -30,6 +30,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "axs5106l"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "412c958bcde165622bed3b9d5839efff5def86bd6c8ce5c4c415f714885e3549"
+dependencies = [
+ "embedded-hal 1.0.0",
+ "heapless 0.9.2",
+ "nb 1.1.0",
+]
+
+[[package]]
 name = "az"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -84,7 +95,7 @@ dependencies = [
  "embedded-io 0.6.1",
  "embedded-io-async 0.6.1",
  "futures-intrusive",
- "heapless 0.8.0",
+ "heapless 0.9.2",
 ]
 
 [[package]]
@@ -1707,6 +1718,7 @@ name = "waveshare-watch-rs"
 version = "0.4.0"
 dependencies = [
  "axp2101-embedded",
+ "axs5106l",
  "embassy-executor",
  "embassy-futures",
  "embassy-net",
